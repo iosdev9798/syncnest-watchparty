@@ -7,6 +7,24 @@ const PORT = process.env.PORT || 3000;
 const PUBLIC = path.join(__dirname, 'public');
 const rooms = new Map();
 
+function rtcConfig() {
+  const urls = String(process.env.TURN_URLS || process.env.TURN_URL || '')
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' }
+  ];
+  if (urls.length) {
+    const server = { urls };
+    if (process.env.TURN_USERNAME) server.username = process.env.TURN_USERNAME;
+    if (process.env.TURN_CREDENTIAL) server.credential = process.env.TURN_CREDENTIAL;
+    iceServers.push(server);
+  }
+  return { iceServers };
+}
+
 function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
@@ -92,6 +110,11 @@ function serveStatic(req, res, urlPath) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+  if (req.method === 'GET' && url.pathname === '/api/rtc-config') {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(rtcConfig()));
+  }
 
   if (req.method === 'GET' && url.pathname === '/events') {
     const roomId = cleanText(url.searchParams.get('room'), 80);
@@ -197,6 +220,6 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(405); res.end('Method not allowed');
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`SyncNest running on http://localhost:${PORT}`);
 });
