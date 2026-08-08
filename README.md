@@ -46,3 +46,16 @@ Microphone access works on `localhost` during development, but browsers require 
 - Room state lives in server memory. Restarting the server clears room state.
 - For public use, add login, moderation, rate limiting, persistence, abuse protection and production TURN/SFU infrastructure.
 - Use your own name/branding rather than copying another service's trademark or exact visual identity.
+
+
+## Voice calling demo (STUN + TURN)
+
+Voice calling now reads ICE configuration from the server. It always includes Google STUN and can add a TURN relay when these Render environment variables are present:
+
+- `TURN_URLS` — comma-separated TURN URLs from your TURN provider
+- `TURN_USERNAME` — TURN username
+- `TURN_CREDENTIAL` — TURN password/credential
+
+For a one-day demo, Metered's Open Relay currently offers a free TURN tier (20 GB/month) and no credit card is required to start. Create an account, copy the TURN credentials/URLs from its dashboard, then add the three variables above in Render. Render keeps environment variables out of your source code and can redeploy after saving them.
+
+If TURN variables are absent, the app still works with STUN-only WebRTC.
