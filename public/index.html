@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Free synchronized YouTube watch rooms with built-in voice calls." />
+  <title>SyncNest — Watch & Talk Together</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/">SyncNest</a>
+      <div class="online"><span class="dot"></span><span id="presenceLabel">Connecting…</span></div>
+    </header>
+
+    <section id="landing" class="landing card">
+      <div class="hero-copy">
+        <p class="eyebrow">WATCH + TALK, FROM ANYWHERE</p>
+        <h1>Same video. Same moment.</h1>
+        <p class="sub">Create a private room, invite your friends, keep YouTube playback synced, and talk on a built-in voice call.</p>
+      </div>
+      <div class="join-grid">
+        <label>
+          Your name
+          <input id="nameInput" maxlength="30" placeholder="e.g. Riya" autocomplete="name" />
+        </label>
+        <label>
+          Room code
+          <input id="roomInput" maxlength="80" placeholder="e.g. movie-night" />
+        </label>
+        <button id="joinBtn" class="primary">Enter room</button>
+        <button id="createBtn" class="ghost">Create random room</button>
+      </div>
+    </section>
+
+    <section id="roomView" class="room hidden">
+      <div class="room-head card">
+        <div>
+          <p class="eyebrow">ROOM</p>
+          <h2 id="roomTitle">—</h2>
+        </div>
+        <div class="invite-actions">
+          <button id="copyBtn" class="ghost small">Copy invite link</button>
+          <button id="syncBtn" class="ghost small">Re-sync</button>
+        </div>
+      </div>
+
+      <div class="content-grid">
+        <section class="video-card card">
+          <div class="video-loader">
+            <input id="youtubeUrl" placeholder="Paste a YouTube link" />
+            <button id="loadBtn" class="primary">Load video</button>
+          </div>
+          <div class="player-wrap">
+            <div id="player"></div>
+            <div id="emptyState" class="empty-state">
+              <div class="playmark">▶</div>
+              <h3>Paste a YouTube link above</h3>
+              <p>Everyone in the room will receive the same video.</p>
+            </div>
+          </div>
+          <p class="tip">Tip: use YouTube controls normally. Play, pause and seeking are mirrored to everyone in the room.</p>
+        </section>
+
+        <aside class="sidebar card">
+          <div class="sidebar-head">
+            <div>
+              <p class="eyebrow compact">VOICE ROOM</p>
+              <h3>Talk while you watch</h3>
+            </div>
+            <span id="userCount" class="badge">1 online</span>
+          </div>
+
+          <div class="voice-body">
+            <div class="voice-orb" id="voiceOrb" aria-hidden="true">
+              <span class="mic-icon">🎙</span>
+            </div>
+            <h4 id="voiceTitle">Voice call is off</h4>
+            <p id="voiceStatus" class="voice-status">Join when you're ready. Your browser will ask for microphone permission.</p>
+
+            <div class="voice-actions">
+              <button id="joinVoiceBtn" class="primary wide">Join voice</button>
+              <button id="muteBtn" class="ghost hidden">Mute</button>
+              <button id="leaveVoiceBtn" class="danger hidden">Leave</button>
+            </div>
+
+            <div class="participants-section">
+              <div class="participants-head">
+                <span>People</span>
+                <span id="voiceCount">0 in voice</span>
+              </div>
+              <div id="participants" class="participants"></div>
+            </div>
+          </div>
+
+          <div class="voice-note">Use headphones to avoid echo. Voice calling needs HTTPS when deployed online.</div>
+          <div id="remoteAudios" class="remote-audios" aria-hidden="true"></div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
