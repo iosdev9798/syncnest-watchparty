@@ -43,12 +43,13 @@ const peers = new Map();
 const pendingCandidates = new Map();
 
 const clientId = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
-const rtcConfig = {
+let rtcConfig = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' }
   ]
 };
+let rtcConfigLoaded = false;
 
 function randomRoom() {
   const a = ['cosmic','quiet','pixel','midnight','mango','violet','orbit','chill'];
@@ -198,6 +199,20 @@ joinVoiceBtn.addEventListener('click', joinVoice);
 muteBtn.addEventListener('click', toggleMute);
 leaveVoiceBtn.addEventListener('click', leaveVoice);
 
+async function loadRtcConfig() {
+  if (rtcConfigLoaded) return;
+  try {
+    const response = await fetch('/api/rtc-config', { cache: 'no-store' });
+    if (response.ok) {
+      const config = await response.json();
+      if (Array.isArray(config.iceServers) && config.iceServers.length) rtcConfig = config;
+    }
+  } catch (err) {
+    console.warn('Using default STUN configuration', err);
+  }
+  rtcConfigLoaded = true;
+}
+
 async function joinVoice() {
   if (voiceJoined) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -206,6 +221,8 @@ async function joinVoice() {
   }
 
   try {
+    voiceStatus.textContent = 'Preparing secure voice connection…';
+    await loadRtcConfig();
     voiceStatus.textContent = 'Requesting microphone permission…';
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -215,7 +232,7 @@ async function joinVoice() {
     muted = false;
     updateVoiceControls();
     await sendAction('voice-status', { active: true });
-    voiceStatus.textContent = 'Connected. You can keep watching while you talk.';
+    voiceStatus.textContent = 'Connecting to other listeners…';
     syncVoicePeers();
   } catch (err) {
     console.error(err);
@@ -306,12 +323,35 @@ function ensurePeer(peerId, shouldOffer = false) {
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'connected') {
       voiceStatus.textContent = 'Connected. You can keep watching while you talk.';
+    } else if (pc.connectionState === 'connecting') {
+      voiceStatus.textContent = 'Connecting to the other listener…';
+    } else if (pc.connectionState === 'failed') {
+      console.warn('WebRTC connection failed', peerId, pc.iceConnectionState);
+      voiceStatus.textContent = 'Voice connection failed. Retrying…';
+      restartPeer(peerId);
     }
-    if (['failed', 'closed'].includes(pc.connectionState)) closePeer(peerId);
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'failed') {
+      try { pc.restartIce(); } catch (_) {}
+      if (peers.get(peerId) === pc) createOffer(peerId, pc);
+    }
   };
 
   if (shouldOffer) createOffer(peerId, pc);
   return pc;
+}
+
+function restartPeer(peerId) {
+  const old = peers.get(peerId);
+  if (old) old.close();
+  peers.delete(peerId);
+  pendingCandidates.delete(peerId);
+  const shouldOffer = clientId < peerId;
+  setTimeout(() => {
+    if (voiceJoined && localStream && !peers.has(peerId)) ensurePeer(peerId, shouldOffer);
+  }, 300);
 }
 
 async function createOffer(peerId, pc) {
