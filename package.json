@@ -2,7 +2,7 @@
   "name": "syncnest-watchparty",
   "version": "1.0.0",
   "private": true,
-  "description": "Dependency-free synchronized YouTube watch party",
+  "description": "Dependency-free synchronized YouTube and local-video watch party",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "engines": { "node": ">=18" }

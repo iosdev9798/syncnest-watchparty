@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Free synchronized YouTube watch rooms with built-in voice calls." />
+  <meta name="description" content="Free synchronized YouTube and local-video watch rooms with built-in voice calls." />
   <title>SyncNest — Watch & Talk Together</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -18,7 +18,7 @@
       <div class="hero-copy">
         <p class="eyebrow">WATCH + TALK, FROM ANYWHERE</p>
         <h1>Same video. Same moment.</h1>
-        <p class="sub">Create a private room, invite your friends, keep YouTube playback synced, and talk on a built-in voice call.</p>
+        <p class="sub">Create a private room, invite your friends, sync YouTube or the same local video file, and talk on a built-in voice call.</p>
       </div>
       <div class="join-grid">
         <label>
@@ -48,19 +48,27 @@
 
       <div class="content-grid">
         <section class="video-card card">
-          <div class="video-loader">
-            <input id="youtubeUrl" placeholder="Paste a YouTube link" />
-            <button id="loadBtn" class="primary">Load video</button>
-          </div>
-          <div class="player-wrap">
-            <div id="player"></div>
-            <div id="emptyState" class="empty-state">
-              <div class="playmark">▶</div>
-              <h3>Paste a YouTube link above</h3>
-              <p>Everyone in the room will receive the same video.</p>
+          <div class="video-loader source-loader">
+            <div class="source-row">
+              <input id="youtubeUrl" placeholder="Paste a YouTube link" aria-label="YouTube link" />
+              <button id="loadBtn" class="primary">Load YouTube</button>
+            </div>
+            <div class="source-divider"><span>or</span></div>
+            <div class="source-row">
+              <input id="localVideoFile" type="file" accept="video/*,.mkv" aria-label="Choose a local video file" />
+              <button id="loadLocalBtn" class="ghost">Use local video</button>
             </div>
           </div>
-          <p class="tip">Tip: use YouTube controls normally. Play, pause and seeking are mirrored to everyone in the room.</p>
+          <div class="player-wrap">
+            <div id="youtubePlayer" class="player-surface"><div id="player"></div></div>
+            <video id="localPlayer" class="player-surface hidden" controls playsinline preload="metadata"></video>
+            <div id="emptyState" class="empty-state">
+              <div class="playmark">▶</div>
+              <h3 id="emptyTitle">Choose a video source above</h3>
+              <p id="emptyText">Load YouTube, or choose a video file from this computer.</p>
+            </div>
+          </div>
+          <p class="tip"><strong>YouTube:</strong> everyone receives the same link. <strong>Local video:</strong> the file is never uploaded; each person selects the same file on their own computer. Play, pause and seeking stay synchronized.</p>
         </section>
 
         <aside class="sidebar card">

@@ -28,7 +28,7 @@ function rtcConfig() {
 function ensureRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
-      videoId: '',
+      source: null,
       state: 'paused',
       currentTime: 0,
       updatedAt: Date.now(),
@@ -39,10 +39,20 @@ function ensureRoom(roomId) {
   return rooms.get(roomId);
 }
 
+function sourceKey(source) {
+  if (!source || typeof source !== 'object') return '';
+  if (source.type === 'youtube') return `youtube:${cleanText(source.videoId, 50)}`;
+  if (source.type === 'local' && source.file) {
+    const f = source.file;
+    return `local:${cleanText(f.name, 180)}:${Number(f.size) || 0}`;
+  }
+  return '';
+}
+
 function snapshot(room) {
   let t = room.currentTime;
   if (room.state === 'playing') t += (Date.now() - room.updatedAt) / 1000;
-  return { videoId: room.videoId, state: room.state, currentTime: Math.max(0, t) };
+  return { source: room.source, state: room.state, currentTime: Math.max(0, t) };
 }
 
 function sendEvent(res, event, data) {
@@ -131,8 +141,11 @@ const server = http.createServer(async (req, res) => {
     });
     res.write(': connected\n\n');
 
+    const existingUser = room.users.get(clientId);
     room.clients.set(clientId, res);
-    room.users.set(clientId, { name, voice: false });
+    // EventSource reconnects automatically. Preserve the user's voice state
+    // instead of silently marking them out of the call on every reconnect.
+    room.users.set(clientId, { name, voice: existingUser ? Boolean(existingUser.voice) : false });
     sendEvent(res, 'room-state', snapshot(room));
     broadcastPresence(room);
 
@@ -168,21 +181,45 @@ const server = http.createServer(async (req, res) => {
       const room = ensureRoom(roomId);
 
       if (body.type === 'load-video') {
-        room.videoId = cleanText(body.videoId, 50);
-        room.state = 'paused';
-        room.currentTime = 0;
-        room.updatedAt = Date.now();
-        broadcast(room, 'load-video', { videoId: room.videoId, by: name });
+        const videoId = cleanText(body.videoId, 50);
+        if (videoId) {
+          room.source = { type: 'youtube', videoId };
+          room.state = 'paused';
+          room.currentTime = 0;
+          room.updatedAt = Date.now();
+          broadcast(room, 'load-media', { source: room.source, by: name });
+        }
+      }
+
+      if (body.type === 'load-local') {
+        const file = body.file && typeof body.file === 'object' ? body.file : {};
+        const localFile = {
+          name: cleanText(file.name, 180),
+          size: Math.max(0, Number(file.size) || 0),
+          lastModified: Math.max(0, Number(file.lastModified) || 0),
+          mime: cleanText(file.mime, 100)
+        };
+        if (localFile.name && localFile.size > 0) {
+          room.source = { type: 'local', file: localFile };
+          room.state = 'paused';
+          room.currentTime = 0;
+          room.updatedAt = Date.now();
+          broadcast(room, 'load-media', { source: room.source, by: name });
+        }
       }
 
       if (body.type === 'player-action') {
         const action = cleanText(body.action, 10);
+        const requestedKey = cleanText(body.mediaKey, 300);
+        if (requestedKey && requestedKey !== sourceKey(room.source)) {
+          res.writeHead(204); return res.end();
+        }
         const t = Number.isFinite(Number(body.currentTime)) ? Math.max(0, Number(body.currentTime)) : 0;
         if (action === 'play') room.state = 'playing';
         if (action === 'pause') room.state = 'paused';
         room.currentTime = t;
         room.updatedAt = Date.now();
-        broadcast(room, 'player-action', { action, currentTime: t, at: Date.now(), by: name }, clientId);
+        broadcast(room, 'player-action', { action, currentTime: t, at: Date.now(), by: name, mediaKey: sourceKey(room.source) }, clientId);
       }
 
       if (body.type === 'request-sync') {

@@ -56,9 +56,17 @@ input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(124,92,255,.
 .invite-actions { display:flex; gap:8px; flex-wrap:wrap; }
 .content-grid { display:grid; grid-template-columns:minmax(0, 1fr) 340px; gap:16px; }
 .video-card { padding:14px; }
-.video-loader { display:grid; grid-template-columns:1fr auto; gap:10px; margin-bottom:12px; }
+.video-loader { display:grid; gap:10px; margin-bottom:12px; }
+.source-row { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:10px; align-items:center; }
+.source-divider { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.12em; font-weight:800; }
+.source-divider::before, .source-divider::after { content:""; height:1px; background:var(--line); flex:1; }
+.source-divider span { padding:0 3px; }
+input[type="file"] { padding:9px 10px; color:var(--muted); }
+input[type="file"]::file-selector-button { border:1px solid var(--line); background:#171f2a; color:var(--text); border-radius:9px; padding:7px 10px; margin-right:10px; font-weight:800; cursor:pointer; }
 .player-wrap { aspect-ratio:16/9; background:#05070a; border-radius:16px; overflow:hidden; position:relative; border:1px solid #1b2430; }
-#player, #player iframe { width:100%; height:100%; }
+#youtubePlayer, #player, #player iframe, #localPlayer { width:100%; height:100%; }
+.player-surface { position:absolute; inset:0; }
+#localPlayer { object-fit:contain; background:#05070a; }
 .empty-state { position:absolute; inset:0; display:grid; place-content:center; text-align:center; padding:20px; color:var(--muted); pointer-events:none; }
 .empty-state h3 { color:var(--text); margin:12px 0 4px; }
 .empty-state p { margin:0; }
@@ -101,6 +109,6 @@ input:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(124,92,255,.
   .landing { padding:28px 18px; min-height:78vh; }
   .join-grid { grid-template-columns:1fr; }
   .room-head { align-items:flex-start; gap:16px; flex-direction:column; }
-  .video-loader { grid-template-columns:1fr; }
+  .source-row { grid-template-columns:1fr; }
   h1 { font-size:clamp(2.5rem, 14vw, 4.6rem); }
 }

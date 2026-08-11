@@ -9,7 +9,13 @@ const copyBtn = document.getElementById('copyBtn');
 const syncBtn = document.getElementById('syncBtn');
 const youtubeUrl = document.getElementById('youtubeUrl');
 const loadBtn = document.getElementById('loadBtn');
+const localVideoFile = document.getElementById('localVideoFile');
+const loadLocalBtn = document.getElementById('loadLocalBtn');
+const localPlayer = document.getElementById('localPlayer');
+const youtubeSurface = document.getElementById('youtubePlayer');
 const emptyState = document.getElementById('emptyState');
+const emptyTitle = document.getElementById('emptyTitle');
+const emptyText = document.getElementById('emptyText');
 const userCount = document.getElementById('userCount');
 const presenceLabel = document.getElementById('presenceLabel');
 const toast = document.getElementById('toast');
@@ -27,10 +33,17 @@ const remoteAudios = document.getElementById('remoteAudios');
 let roomId = '';
 let displayName = '';
 let player = null;
-let playerReady = false;
-let pendingVideoId = '';
+let youtubeReady = false;
+let loadedYoutubeId = '';
+let activeSource = null;
+let activeMediaKey = '';
+let currentLocalFile = null;
+let currentLocalMeta = null;
+let localObjectUrl = '';
+let localReady = false;
+let pendingRoomState = null;
 let applyingRemote = false;
-let lastKnownState = -1;
+let lastKnownState = 'paused';
 let lastTime = 0;
 let pollTimer = null;
 let eventSource = null;
@@ -41,6 +54,7 @@ let voiceJoined = false;
 let muted = false;
 const peers = new Map();
 const pendingCandidates = new Map();
+const pendingAudioPlayback = new Set();
 
 const clientId = (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`);
 let rtcConfig = {
@@ -78,6 +92,30 @@ function extractVideoId(input) {
   return '';
 }
 
+function fileMeta(file) {
+  return {
+    name: String(file?.name || '').slice(0, 180),
+    size: Number(file?.size) || 0,
+    lastModified: Number(file?.lastModified) || 0,
+    mime: String(file?.type || '').slice(0, 100)
+  };
+}
+
+function mediaKey(source) {
+  if (!source) return '';
+  if (source.type === 'youtube') return `youtube:${source.videoId || ''}`;
+  if (source.type === 'local' && source.file) {
+    return `local:${source.file.name || ''}:${Number(source.file.size) || 0}`;
+  }
+  return '';
+}
+
+function localFileMatches(file, expected) {
+  if (!file || !expected) return false;
+  const meta = fileMeta(file);
+  return meta.name === expected.name && meta.size === Number(expected.size || 0);
+}
+
 async function sendAction(type, payload = {}) {
   try {
     await fetch('/api/action', {
@@ -97,10 +135,12 @@ function connectRoomEvents() {
   eventSource.onopen = () => { presenceLabel.textContent = 'Connected'; };
   eventSource.onerror = () => { presenceLabel.textContent = 'Reconnecting…'; };
   eventSource.addEventListener('room-state', e => applyRoomState(JSON.parse(e.data)));
-  eventSource.addEventListener('load-video', e => {
-    const { videoId, by } = JSON.parse(e.data);
-    loadIntoPlayer(videoId, false);
-    showToast(`${by || 'Someone'} loaded a video`);
+  eventSource.addEventListener('load-media', e => {
+    const { source, by } = JSON.parse(e.data);
+    activateSource(source);
+    pendingRoomState = { source, state: 'paused', currentTime: 0 };
+    tryApplyRoomState();
+    showToast(`${by || 'Someone'} loaded ${source?.type === 'local' ? 'a local video' : 'a YouTube video'}`);
   });
   eventSource.addEventListener('player-action', e => applyRemoteAction(JSON.parse(e.data)));
   eventSource.addEventListener('presence', e => {
@@ -158,6 +198,33 @@ loadBtn.addEventListener('click', () => {
 });
 youtubeUrl.addEventListener('keydown', e => { if (e.key === 'Enter') loadBtn.click(); });
 
+localVideoFile.addEventListener('change', () => {
+  const file = localVideoFile.files?.[0];
+  if (!file) return;
+  if (activeSource?.type === 'local' && localFileMatches(file, activeSource.file)) {
+    attachLocalFile(file);
+    sendAction('request-sync');
+    showToast('Local video matched. Re-syncing…');
+  }
+});
+
+loadLocalBtn.addEventListener('click', () => {
+  const file = localVideoFile.files?.[0];
+  if (!file) return showToast('Choose a local video file first');
+
+  if (activeSource?.type === 'local' && localFileMatches(file, activeSource.file)) {
+    attachLocalFile(file);
+    sendAction('request-sync');
+    return showToast('Using the room’s local video');
+  }
+
+  const meta = fileMeta(file);
+  attachLocalFile(file);
+  activateSource({ type: 'local', file: meta });
+  pendingRoomState = { source: activeSource, state: 'paused', currentTime: 0 };
+  sendAction('load-local', { file: meta });
+});
+
 function renderParticipants() {
   const sorted = [...roomUsers].sort((a, b) => {
     if (a.id === clientId) return -1;
@@ -198,6 +265,34 @@ function renderParticipants() {
 joinVoiceBtn.addEventListener('click', joinVoice);
 muteBtn.addEventListener('click', toggleMute);
 leaveVoiceBtn.addEventListener('click', leaveVoice);
+
+// If a browser blocks remote WebRTC audio autoplay, the next real user
+// interaction retries every pending remote audio element. The previous code
+// told the user to tap, but never actually retried playback.
+function retryRemoteAudioPlayback() {
+  for (const audio of [...pendingAudioPlayback]) {
+    if (!audio.isConnected || !audio.srcObject) {
+      pendingAudioPlayback.delete(audio);
+      continue;
+    }
+    audio.muted = false;
+    audio.volume = 1;
+    audio.play().then(() => {
+      pendingAudioPlayback.delete(audio);
+      if (voiceJoined) voiceStatus.textContent = 'Connected. You can keep watching while you talk.';
+    }).catch(() => {});
+  }
+}
+
+document.addEventListener('pointerdown', retryRemoteAudioPlayback, { passive: true });
+document.addEventListener('keydown', retryRemoteAudioPlayback);
+
+function hasTurnServer() {
+  return (rtcConfig.iceServers || []).some(server => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some(url => /^turns?:/i.test(String(url || '')));
+  });
+}
 
 async function loadRtcConfig() {
   if (rtcConfigLoaded) return;
@@ -312,11 +407,28 @@ function ensurePeer(peerId, shouldOffer = false) {
       audio.id = `audio-${peerId}`;
       audio.autoplay = true;
       audio.playsInline = true;
+      audio.preload = 'auto';
+      audio.volume = 1;
+      audio.muted = false;
       remoteAudios.appendChild(audio);
     }
-    audio.srcObject = event.streams[0];
-    audio.play().catch(() => {
-      voiceStatus.textContent = 'Tap anywhere once if your browser blocks incoming audio.';
+
+    // event.streams can be empty in some browser/WebRTC combinations.
+    // Build a stream from the received track so audio still has a source.
+    const remoteStream = event.streams && event.streams[0]
+      ? event.streams[0]
+      : new MediaStream([event.track]);
+
+    if (audio.srcObject !== remoteStream) audio.srcObject = remoteStream;
+    audio.muted = false;
+    audio.volume = 1;
+
+    audio.play().then(() => {
+      pendingAudioPlayback.delete(audio);
+    }).catch(err => {
+      console.warn('Remote audio autoplay was blocked', peerId, err);
+      pendingAudioPlayback.add(audio);
+      voiceStatus.textContent = 'Incoming audio is blocked. Tap anywhere once to enable sound.';
     });
   };
 
@@ -327,7 +439,9 @@ function ensurePeer(peerId, shouldOffer = false) {
       voiceStatus.textContent = 'Connecting to the other listener…';
     } else if (pc.connectionState === 'failed') {
       console.warn('WebRTC connection failed', peerId, pc.iceConnectionState);
-      voiceStatus.textContent = 'Voice connection failed. Retrying…';
+      voiceStatus.textContent = hasTurnServer()
+        ? 'Voice connection failed. Retrying…'
+        : 'Voice connection failed. This network may require a TURN server.';
       restartPeer(peerId);
     }
   };
@@ -419,7 +533,12 @@ function closePeer(peerId) {
   peers.delete(peerId);
   pendingCandidates.delete(peerId);
   const audio = document.getElementById(`audio-${peerId}`);
-  if (audio) audio.remove();
+  if (audio) {
+    pendingAudioPlayback.delete(audio);
+    try { audio.pause(); } catch (_) {}
+    audio.srcObject = null;
+    audio.remove();
+  }
 }
 
 window.onYouTubeIframeAPIReady = function () {
@@ -427,84 +546,213 @@ window.onYouTubeIframeAPIReady = function () {
     height: '100%', width: '100%',
     playerVars: { playsinline: 1, rel: 0, modestbranding: 1, origin: location.origin },
     events: { onReady: () => {
-      playerReady = true;
-      if (pendingVideoId) loadIntoPlayer(pendingVideoId, false);
+      youtubeReady = true;
+      if (activeSource?.type === 'youtube') cueYoutube(activeSource.videoId);
+      tryApplyRoomState();
       startPlayerPolling();
     }}
   });
 };
 
-function loadIntoPlayer(videoId, autoplay=false) {
-  pendingVideoId = videoId;
-  emptyState.classList.add('hidden');
-  if (!playerReady) return;
+function setEmptyState(title, text, visible = true) {
+  emptyTitle.textContent = title;
+  emptyText.textContent = text;
+  emptyState.classList.toggle('hidden', !visible);
+}
+
+function cueYoutube(videoId) {
+  if (!youtubeReady || !videoId || loadedYoutubeId === videoId) return;
   applyingRemote = true;
   player.cueVideoById(videoId);
+  loadedYoutubeId = videoId;
   setTimeout(() => {
-    if (autoplay) player.playVideo();
     applyingRemote = false;
-    lastKnownState = player.getPlayerState();
-    lastTime = player.getCurrentTime() || 0;
+    lastKnownState = getPlaybackState();
+    lastTime = getCurrentTime();
+    tryApplyRoomState();
   }, 350);
 }
 
-function applyRoomState(state) {
-  if (!state || !state.videoId) return;
-  if (pendingVideoId !== state.videoId) loadIntoPlayer(state.videoId, false);
-  const apply = () => {
-    if (!playerReady) return setTimeout(apply, 150);
-    applyingRemote = true;
-    player.seekTo(state.currentTime || 0, true);
-    if (state.state === 'playing') player.playVideo(); else player.pauseVideo();
-    setTimeout(() => {
-      applyingRemote = false;
-      lastKnownState = player.getPlayerState();
-      lastTime = player.getCurrentTime() || 0;
-    }, 450);
-  };
-  setTimeout(apply, 350);
+function attachLocalFile(file) {
+  if (!file) return;
+  if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
+  currentLocalFile = file;
+  currentLocalMeta = fileMeta(file);
+  localReady = false;
+  localObjectUrl = URL.createObjectURL(file);
+  localPlayer.src = localObjectUrl;
+  localPlayer.load();
 }
 
-function applyRemoteAction({ action, currentTime }) {
-  if (!playerReady || !pendingVideoId) return;
+function activateSource(source) {
+  if (!source || !['youtube', 'local'].includes(source.type)) return;
+  const nextKey = mediaKey(source);
+  const changed = nextKey !== activeMediaKey;
+  activeSource = source;
+  activeMediaKey = nextKey;
+
+  if (source.type === 'youtube') {
+    localPlayer.pause();
+    localPlayer.classList.add('hidden');
+    youtubeSurface.classList.remove('hidden');
+    setEmptyState('Loading YouTube…', 'The room is switching to the shared YouTube video.', !youtubeReady);
+    if (youtubeReady) {
+      setEmptyState('', '', false);
+      cueYoutube(source.videoId);
+    }
+  } else {
+    if (youtubeReady && player?.pauseVideo) {
+      try { player.pauseVideo(); } catch (_) {}
+    }
+    youtubeSurface.classList.add('hidden');
+
+    if (currentLocalFile && localFileMatches(currentLocalFile, source.file)) {
+      localPlayer.classList.remove('hidden');
+      setEmptyState('', '', false);
+      if (!localPlayer.src) attachLocalFile(currentLocalFile);
+    } else {
+      localReady = false;
+      localPlayer.pause();
+      localPlayer.classList.add('hidden');
+      setEmptyState(
+        `Select “${source.file?.name || 'the same video'}”`,
+        'This local file stays on your computer. Choose the matching file above to join synchronized playback.',
+        true
+      );
+    }
+  }
+
+  if (changed) {
+    lastKnownState = 'paused';
+    lastTime = 0;
+  }
+}
+
+localPlayer.addEventListener('loadedmetadata', () => {
+  localReady = true;
+  if (activeSource?.type === 'local' && currentLocalFile && localFileMatches(currentLocalFile, activeSource.file)) {
+    localPlayer.classList.remove('hidden');
+    setEmptyState('', '', false);
+    tryApplyRoomState();
+  }
+});
+
+localPlayer.addEventListener('error', () => {
+  localReady = false;
+  if (activeSource?.type === 'local') {
+    setEmptyState('This video cannot be played', 'Try MP4 (H.264/AAC) or WebM, depending on your browser.', true);
+    showToast('Browser cannot play this video format');
+  }
+});
+
+function activePlayerReady() {
+  if (!activeSource) return false;
+  if (activeSource.type === 'youtube') return youtubeReady && loadedYoutubeId === activeSource.videoId;
+  return localReady && currentLocalFile && localFileMatches(currentLocalFile, activeSource.file);
+}
+
+function getPlaybackState() {
+  if (!activePlayerReady()) return 'paused';
+  if (activeSource.type === 'youtube') {
+    const state = player.getPlayerState();
+    return state === YT.PlayerState.PLAYING ? 'playing' : 'paused';
+  }
+  return !localPlayer.paused && !localPlayer.ended ? 'playing' : 'paused';
+}
+
+function getCurrentTime() {
+  if (!activePlayerReady()) return 0;
+  if (activeSource.type === 'youtube') return player.getCurrentTime() || 0;
+  return Number.isFinite(localPlayer.currentTime) ? localPlayer.currentTime : 0;
+}
+
+function seekActivePlayer(time) {
+  const t = Math.max(0, Number(time) || 0);
+  if (activeSource.type === 'youtube') player.seekTo(t, true);
+  else localPlayer.currentTime = Math.min(t, Number.isFinite(localPlayer.duration) ? localPlayer.duration : t);
+}
+
+function playActivePlayer() {
+  if (activeSource.type === 'youtube') {
+    player.playVideo();
+  } else {
+    localPlayer.play().catch(() => showToast('Tap play once to allow video playback'));
+  }
+}
+
+function pauseActivePlayer() {
+  if (activeSource.type === 'youtube') player.pauseVideo();
+  else localPlayer.pause();
+}
+
+function applyRoomState(state) {
+  if (!state || !state.source) return;
+  pendingRoomState = state;
+  if (mediaKey(state.source) !== activeMediaKey) activateSource(state.source);
+  tryApplyRoomState();
+}
+
+function tryApplyRoomState() {
+  const state = pendingRoomState;
+  if (!state || !state.source) return;
+  if (mediaKey(state.source) !== activeMediaKey) activateSource(state.source);
+  if (!activePlayerReady()) return;
+
   applyingRemote = true;
-  if (Math.abs((player.getCurrentTime() || 0) - currentTime) > 0.8 || action === 'seek') player.seekTo(currentTime, true);
-  if (action === 'play') player.playVideo();
-  if (action === 'pause') player.pauseVideo();
+  seekActivePlayer(state.currentTime || 0);
+  if (state.state === 'playing') playActivePlayer(); else pauseActivePlayer();
   setTimeout(() => {
     applyingRemote = false;
-    lastKnownState = player.getPlayerState();
-    lastTime = player.getCurrentTime() || 0;
+    lastKnownState = getPlaybackState();
+    lastTime = getCurrentTime();
+  }, 400);
+}
+
+function applyRemoteAction({ action, currentTime, mediaKey: incomingKey }) {
+  if (!activePlayerReady()) return;
+  if (incomingKey && incomingKey !== activeMediaKey) return;
+  applyingRemote = true;
+  if (Math.abs(getCurrentTime() - currentTime) > 0.8 || action === 'seek') seekActivePlayer(currentTime);
+  if (action === 'play') playActivePlayer();
+  if (action === 'pause') pauseActivePlayer();
+  setTimeout(() => {
+    applyingRemote = false;
+    lastKnownState = getPlaybackState();
+    lastTime = getCurrentTime();
   }, 350);
 }
 
 function startPlayerPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(() => {
-    if (!playerReady || applyingRemote || !pendingVideoId || !roomId) return;
-    const state = player.getPlayerState();
-    const t = player.getCurrentTime() || 0;
+    if (!activePlayerReady() || applyingRemote || !activeMediaKey || !roomId) return;
+    const state = getPlaybackState();
+    const t = getCurrentTime();
     if (state !== lastKnownState) {
-      if (state === YT.PlayerState.PLAYING) sendAction('player-action', { action: 'play', currentTime: t });
-      if (state === YT.PlayerState.PAUSED) sendAction('player-action', { action: 'pause', currentTime: t });
+      sendAction('player-action', { action: state === 'playing' ? 'play' : 'pause', currentTime: t, mediaKey: activeMediaKey });
       lastKnownState = state;
       lastTime = t;
       return;
     }
-    const expectedDelta = state === YT.PlayerState.PLAYING ? 0.25 : 0;
+    const expectedDelta = state === 'playing' ? 0.25 : 0;
     const actualDelta = t - lastTime;
-    if (Math.abs(actualDelta - expectedDelta) > 1.5) sendAction('player-action', { action: 'seek', currentTime: t });
+    if (Math.abs(actualDelta - expectedDelta) > 1.5) {
+      sendAction('player-action', { action: 'seek', currentTime: t, mediaKey: activeMediaKey });
+    }
     lastTime = t;
   }, 250);
 }
 
 window.addEventListener('beforeunload', () => {
+  if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
   if (voiceJoined) {
     navigator.sendBeacon('/api/action', new Blob([JSON.stringify({
       type: 'voice-status', roomId, name: displayName, clientId, active: false
     })], { type: 'application/json' }));
   }
 });
+
+startPlayerPolling();
 
 const params = new URLSearchParams(location.search);
 const presetRoom = params.get('room');
