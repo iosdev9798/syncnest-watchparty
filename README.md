@@ -6,6 +6,8 @@ A dependency-free Node.js website for watching YouTube or the same local video f
 - Private room codes + shareable invite links
 - YouTube URL playback
 - Local computer video playback with a native HTML5 video player
+- VLC-style local track controls for audio-language and subtitle selection when the browser exposes embedded tracks
+- Load external `.srt` or `.vtt` subtitle files directly in the browser
 - Synchronized play, pause and seeking for both source types
 - Late joiners jump to the current room position
 - Built-in peer-to-peer voice call
@@ -20,6 +22,13 @@ Local video files are **not uploaded to the SyncNest server**. When one person c
 Each participant must choose the same local video file on their own computer. Once the filename and file size match, SyncNest synchronizes play, pause and seeking.
 
 This avoids uploading very large movie files and keeps the video on each person's device. Browser codec support still applies; MP4 with H.264/AAC and WebM are the safest choices. MKV support varies by browser and codec.
+
+### Audio languages and subtitles
+When a local video contains audio or subtitle tracks that the browser exposes, SyncNest shows them below the player in **Audio language** and **Subtitles** menus. Each viewer can choose their own language without affecting room playback sync.
+
+You can also load one or more external `.srt` or `.vtt` subtitle files. SRT files are converted to WebVTT in the browser and are never uploaded. The first subtitle file you add is enabled automatically; use **Subtitles → Off** to hide it or select another track.
+
+Because local playback still uses the browser's media engine, a file can contain tracks/codecs that VLC understands but the browser does not expose or decode. In that case SyncNest can only offer the tracks available through the browser.
 
 ## Run it
 Requires Node.js 18 or newer.

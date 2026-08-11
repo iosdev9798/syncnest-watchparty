@@ -68,7 +68,28 @@
               <p id="emptyText">Load YouTube, or choose a video file from this computer.</p>
             </div>
           </div>
-          <p class="tip"><strong>YouTube:</strong> everyone receives the same link. <strong>Local video:</strong> the file is never uploaded; each person selects the same file on their own computer. Play, pause and seeking stay synchronized.</p>
+
+          <div id="localTrackControls" class="track-controls hidden" aria-label="Local video language and subtitle controls">
+            <div class="track-control">
+              <label for="audioTrackSelect">Audio language</label>
+              <select id="audioTrackSelect" aria-label="Audio language">
+                <option value="">Default audio</option>
+              </select>
+            </div>
+            <div class="track-control">
+              <label for="subtitleTrackSelect">Subtitles</label>
+              <select id="subtitleTrackSelect" aria-label="Subtitle track">
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div class="track-control subtitle-file-control">
+              <label for="subtitleFile">External subtitles</label>
+              <input id="subtitleFile" type="file" accept=".srt,.vtt,text/vtt,application/x-subrip" multiple aria-label="Add SRT or VTT subtitles" />
+            </div>
+            <p id="trackSupportNote" class="track-support-note">Embedded audio/subtitle tracks appear here when your browser exposes them. You can also add SRT or VTT subtitle files.</p>
+          </div>
+
+          <p class="tip"><strong>YouTube:</strong> everyone receives the same link. <strong>Local video:</strong> the file is never uploaded; each person selects the same file on their own computer. Play, pause and seeking stay synchronized. Audio language and subtitle choices are local to each viewer.</p>
         </section>
 
         <aside class="sidebar card">

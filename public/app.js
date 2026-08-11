@@ -12,6 +12,11 @@ const loadBtn = document.getElementById('loadBtn');
 const localVideoFile = document.getElementById('localVideoFile');
 const loadLocalBtn = document.getElementById('loadLocalBtn');
 const localPlayer = document.getElementById('localPlayer');
+const localTrackControls = document.getElementById('localTrackControls');
+const audioTrackSelect = document.getElementById('audioTrackSelect');
+const subtitleTrackSelect = document.getElementById('subtitleTrackSelect');
+const subtitleFile = document.getElementById('subtitleFile');
+const trackSupportNote = document.getElementById('trackSupportNote');
 const youtubeSurface = document.getElementById('youtubePlayer');
 const emptyState = document.getElementById('emptyState');
 const emptyTitle = document.getElementById('emptyTitle');
@@ -41,6 +46,7 @@ let currentLocalFile = null;
 let currentLocalMeta = null;
 let localObjectUrl = '';
 let localReady = false;
+let externalSubtitleUrls = [];
 let pendingRoomState = null;
 let applyingRemote = false;
 let lastKnownState = 'paused';
@@ -573,15 +579,198 @@ function cueYoutube(videoId) {
   }, 350);
 }
 
+function listTracks(trackList) {
+  if (!trackList || typeof trackList.length !== 'number') return [];
+  const tracks = [];
+  for (let i = 0; i < trackList.length; i += 1) tracks.push(trackList[i]);
+  return tracks;
+}
+
+function displayLanguage(code) {
+  const language = String(code || '').trim();
+  if (!language) return '';
+  try {
+    if (Intl.DisplayNames) {
+      const names = new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' });
+      return names.of(language) || language.toUpperCase();
+    }
+  } catch (_) {}
+  return language.toUpperCase();
+}
+
+function mediaTrackLabel(track, fallback) {
+  const label = String(track?.label || '').trim();
+  const language = displayLanguage(track?.language);
+  if (label && language && !label.toLowerCase().includes(String(track.language || '').toLowerCase())) {
+    return `${label} — ${language}`;
+  }
+  return label || language || fallback;
+}
+
+function refreshTrackControls() {
+  const localIsActive = activeSource?.type === 'local' && Boolean(currentLocalFile);
+  localTrackControls.classList.toggle('hidden', !localIsActive);
+  if (!localIsActive) return;
+
+  const audioTracks = listTracks(localPlayer.audioTracks);
+  audioTrackSelect.replaceChildren();
+
+  if (audioTracks.length) {
+    audioTrackSelect.disabled = false;
+    let selectedAudio = 0;
+    audioTracks.forEach((track, index) => {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = mediaTrackLabel(track, `Audio track ${index + 1}`);
+      audioTrackSelect.appendChild(option);
+      if (track.enabled) selectedAudio = index;
+    });
+    audioTrackSelect.value = String(selectedAudio);
+  } else {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'Default audio';
+    audioTrackSelect.appendChild(option);
+    audioTrackSelect.disabled = true;
+  }
+
+  const textTracks = listTracks(localPlayer.textTracks)
+    .map((track, index) => ({ track, index }))
+    .filter(({ track }) => ['subtitles', 'captions'].includes(String(track.kind || '').toLowerCase()));
+
+  subtitleTrackSelect.replaceChildren();
+  const offOption = document.createElement('option');
+  offOption.value = 'off';
+  offOption.textContent = 'Off';
+  subtitleTrackSelect.appendChild(offOption);
+
+  let selectedSubtitle = 'off';
+  for (const { track, index } of textTracks) {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = mediaTrackLabel(track, `Subtitle ${index + 1}`);
+    subtitleTrackSelect.appendChild(option);
+    if (track.mode === 'showing') selectedSubtitle = String(index);
+  }
+  subtitleTrackSelect.value = selectedSubtitle;
+  subtitleTrackSelect.disabled = textTracks.length === 0;
+
+  const audioMessage = audioTracks.length > 1
+    ? `${audioTracks.length} audio tracks detected.`
+    : audioTracks.length === 1
+      ? 'One audio track detected.'
+      : "Using the browser's default audio track.";
+  const subtitleMessage = textTracks.length
+    ? `${textTracks.length} subtitle/caption track${textTracks.length === 1 ? '' : 's'} available.`
+    : 'No embedded subtitles detected; you can add SRT or VTT files.';
+  trackSupportNote.textContent = `${audioMessage} ${subtitleMessage}`;
+}
+
+function selectAudioTrack(index) {
+  const audioTracks = listTracks(localPlayer.audioTracks);
+  if (!audioTracks.length) return;
+  const selected = Math.max(0, Math.min(Number(index) || 0, audioTracks.length - 1));
+  audioTracks.forEach((track, i) => {
+    try { track.enabled = i === selected; } catch (_) {}
+  });
+  refreshTrackControls();
+}
+
+function selectSubtitleTrack(index) {
+  const textTracks = listTracks(localPlayer.textTracks);
+  const selected = index === 'off' ? -1 : Number(index);
+  textTracks.forEach((track, i) => {
+    if (!['subtitles', 'captions'].includes(String(track.kind || '').toLowerCase())) return;
+    try { track.mode = i === selected ? 'showing' : 'disabled'; } catch (_) {}
+  });
+  refreshTrackControls();
+}
+
+function inferSubtitleLanguage(filename) {
+  const stem = String(filename || '').replace(/\.(srt|vtt)$/i, '');
+  const match = stem.match(/(?:^|[._ -])([a-z]{2,3}(?:-[A-Za-z]{2})?)$/i);
+  return match ? match[1].toLowerCase() : '';
+}
+
+function srtToVtt(input) {
+  let text = String(input || '').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trim();
+  text = text.replace(/(\d{1,2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return `WEBVTT\n\n${text}\n`;
+}
+
+function clearExternalSubtitles() {
+  for (const track of localPlayer.querySelectorAll('track[data-external-subtitle="true"]')) track.remove();
+  for (const url of externalSubtitleUrls) URL.revokeObjectURL(url);
+  externalSubtitleUrls = [];
+  subtitleFile.value = '';
+}
+
+async function addExternalSubtitles(files) {
+  const selectedFiles = [...(files || [])];
+  if (!selectedFiles.length) return;
+
+  let firstAddedTrack = null;
+  for (const file of selectedFiles) {
+    if (!/\.(srt|vtt)$/i.test(file.name || '')) {
+      showToast(`Skipped unsupported subtitle: ${file.name || 'file'}`);
+      continue;
+    }
+
+    try {
+      const sourceText = await file.text();
+      const isSrt = /\.srt$/i.test(file.name || '');
+      const subtitleText = isSrt ? srtToVtt(sourceText) : sourceText;
+      const blob = new Blob([subtitleText], { type: 'text/vtt;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      externalSubtitleUrls.push(url);
+
+      const trackElement = document.createElement('track');
+      trackElement.kind = 'subtitles';
+      trackElement.label = file.name.replace(/\.(srt|vtt)$/i, '');
+      const language = inferSubtitleLanguage(file.name);
+      if (language) trackElement.srclang = language;
+      trackElement.src = url;
+      trackElement.dataset.externalSubtitle = 'true';
+      localPlayer.appendChild(trackElement);
+      try { trackElement.track.mode = 'disabled'; } catch (_) {}
+      if (!firstAddedTrack) firstAddedTrack = trackElement.track;
+    } catch (err) {
+      console.error('Subtitle load failed', file.name, err);
+      showToast(`Could not load ${file.name || 'subtitle'}`);
+    }
+  }
+
+  refreshTrackControls();
+  if (firstAddedTrack) {
+    const textTracks = listTracks(localPlayer.textTracks);
+    const firstIndex = textTracks.findIndex(track => track === firstAddedTrack);
+    if (firstIndex >= 0) selectSubtitleTrack(String(firstIndex));
+    showToast(`${selectedFiles.length === 1 ? 'Subtitle' : 'Subtitles'} added`);
+  }
+}
+
+audioTrackSelect.addEventListener('change', () => selectAudioTrack(audioTrackSelect.value));
+subtitleTrackSelect.addEventListener('change', () => selectSubtitleTrack(subtitleTrackSelect.value));
+subtitleFile.addEventListener('change', () => addExternalSubtitles(subtitleFile.files));
+
+for (const trackList of [localPlayer.textTracks, localPlayer.audioTracks]) {
+  if (!trackList?.addEventListener) continue;
+  trackList.addEventListener('addtrack', refreshTrackControls);
+  trackList.addEventListener('removetrack', refreshTrackControls);
+  trackList.addEventListener('change', refreshTrackControls);
+}
+
 function attachLocalFile(file) {
   if (!file) return;
   if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
+  clearExternalSubtitles();
   currentLocalFile = file;
   currentLocalMeta = fileMeta(file);
   localReady = false;
   localObjectUrl = URL.createObjectURL(file);
   localPlayer.src = localObjectUrl;
   localPlayer.load();
+  refreshTrackControls();
 }
 
 function activateSource(source) {
@@ -622,6 +811,8 @@ function activateSource(source) {
     }
   }
 
+  refreshTrackControls();
+
   if (changed) {
     lastKnownState = 'paused';
     lastTime = 0;
@@ -630,6 +821,8 @@ function activateSource(source) {
 
 localPlayer.addEventListener('loadedmetadata', () => {
   localReady = true;
+  refreshTrackControls();
+  setTimeout(refreshTrackControls, 250);
   if (activeSource?.type === 'local' && currentLocalFile && localFileMatches(currentLocalFile, activeSource.file)) {
     localPlayer.classList.remove('hidden');
     setEmptyState('', '', false);
@@ -745,6 +938,7 @@ function startPlayerPolling() {
 
 window.addEventListener('beforeunload', () => {
   if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
+  for (const url of externalSubtitleUrls) URL.revokeObjectURL(url);
   if (voiceJoined) {
     navigator.sendBeacon('/api/action', new Blob([JSON.stringify({
       type: 'voice-status', roomId, name: displayName, clientId, active: false
