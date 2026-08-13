@@ -12,6 +12,7 @@ const loadBtn = document.getElementById('loadBtn');
 const localVideoFile = document.getElementById('localVideoFile');
 const loadLocalBtn = document.getElementById('loadLocalBtn');
 const localPlayer = document.getElementById('localPlayer');
+const localAltAudio = document.getElementById('localAltAudio');
 const localTrackControls = document.getElementById('localTrackControls');
 const audioTrackSelect = document.getElementById('audioTrackSelect');
 const subtitleTrackSelect = document.getElementById('subtitleTrackSelect');
@@ -47,6 +48,30 @@ let currentLocalMeta = null;
 let localObjectUrl = '';
 let localReady = false;
 let externalSubtitleUrls = [];
+let generatedEmbeddedSubtitleUrl = '';
+let generatedAudioUrl = '';
+let altAudioActive = false;
+let altAudioPlayWarningShown = false;
+let audioRoutingContext = null;
+let audioRoutingSource = null;
+let audioRoutingGain = null;
+let ffmpegClient = null;
+let ffmpegMounted = false;
+let ffmpegInputPath = '';
+let ffmpegTaskQueue = Promise.resolve();
+let ffmpegWorkerBlobUrl = '';
+let ffmpegCoreBlobUrl = '';
+let ffmpegWasmBlobUrl = '';
+let inspectedTracks = { key: '', audio: [], subtitles: [] };
+let inspectingLocalMedia = false;
+let selectedInspectedAudio = null;
+let selectedSubtitleValue = 'off';
+let trackOperationMessage = '';
+let preparingAudioTrack = false;
+let preparingSubtitleTrack = false;
+let audioJobToken = 0;
+let subtitleJobToken = 0;
+let inspectionJobToken = 0;
 let pendingRoomState = null;
 let applyingRemote = false;
 let lastKnownState = 'paused';
@@ -607,36 +632,271 @@ function mediaTrackLabel(track, fallback) {
   return label || language || fallback;
 }
 
+function inspectedTrackLabel(track, fallback) {
+  const title = String(track?.title || '').trim();
+  const language = displayLanguage(track?.language);
+  const codec = String(track?.codec || '').toUpperCase();
+  const channels = Number(track?.channels) || 0;
+  const details = [codec, channels > 2 ? `${channels}ch` : ''].filter(Boolean).join(' · ');
+  let primary = title || language || fallback;
+  if (title && language && !title.toLowerCase().includes(language.toLowerCase())) primary = `${title} — ${language}`;
+  return details ? `${primary} (${details})` : primary;
+}
+
+function fileInspectionKey(file) {
+  if (!file) return '';
+  return `${file.name}:${file.size}:${file.lastModified || 0}`;
+}
+
+const FFMPEG_WORKER_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/umd/814.ffmpeg.js';
+const FFMPEG_CORE_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.js';
+const FFMPEG_WASM_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd/ffmpeg-core.wasm';
+
+async function fetchFfmpegAsset(url, mime) {
+  const response = await fetch(url, { mode: 'cors', cache: 'force-cache' });
+  if (!response.ok) throw new Error(`Could not download local media engine asset (${response.status})`);
+  const bytes = await response.arrayBuffer();
+  return URL.createObjectURL(new Blob([bytes], { type: mime }));
+}
+
+class LocalFFmpegClient {
+  constructor() {
+    this.worker = null;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.listeners = { log: new Set(), progress: new Set() };
+    this.loaded = false;
+  }
+
+  registerWorkerHandlers() {
+    this.worker.onmessage = ({ data }) => {
+      if (!data) return;
+      if (data.type === 'LOG') {
+        for (const listener of this.listeners.log) listener(data.data || {});
+        return;
+      }
+      if (data.type === 'PROGRESS') {
+        for (const listener of this.listeners.progress) listener(data.data || {});
+        return;
+      }
+      const pending = this.pending.get(data.id);
+      if (!pending) return;
+      this.pending.delete(data.id);
+      if (data.type === 'ERROR') pending.reject(new Error(String(data.data || 'FFmpeg error')));
+      else pending.resolve(data.data);
+    };
+    this.worker.onerror = event => {
+      const err = new Error(event?.message || 'Could not start the local media engine');
+      for (const { reject } of this.pending.values()) reject(err);
+      this.pending.clear();
+    };
+  }
+
+  send(type, data) {
+    if (!this.worker) return Promise.reject(new Error('Local media engine is not loaded'));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      try {
+        this.worker.postMessage({ id, type, data });
+      } catch (err) {
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
+
+  async load() {
+    if (this.loaded) return;
+    if (!this.worker) {
+      if (!ffmpegWorkerBlobUrl || !ffmpegCoreBlobUrl || !ffmpegWasmBlobUrl) {
+        [ffmpegWorkerBlobUrl, ffmpegCoreBlobUrl, ffmpegWasmBlobUrl] = await Promise.all([
+          fetchFfmpegAsset(FFMPEG_WORKER_URL, 'application/javascript'),
+          fetchFfmpegAsset(FFMPEG_CORE_URL, 'application/javascript'),
+          fetchFfmpegAsset(FFMPEG_WASM_URL, 'application/wasm')
+        ]);
+      }
+      this.worker = new Worker(ffmpegWorkerBlobUrl);
+      this.registerWorkerHandlers();
+    }
+    await this.send('LOAD', { coreURL: ffmpegCoreBlobUrl, wasmURL: ffmpegWasmBlobUrl });
+    this.loaded = true;
+  }
+
+  terminate() {
+    const err = new Error('Local media operation cancelled');
+    for (const { reject } of this.pending.values()) reject(err);
+    this.pending.clear();
+    try { this.worker?.terminate(); } catch (_) {}
+    this.worker = null;
+    this.loaded = false;
+  }
+
+  on(type, listener) { this.listeners[type]?.add(listener); }
+  off(type, listener) { this.listeners[type]?.delete(listener); }
+  ffprobe(args) { return this.send('FFPROBE', { args, timeout: -1 }); }
+  exec(args) { return this.send('EXEC', { args, timeout: -1 }); }
+  readFile(path, encoding = 'binary') { return this.send('READ_FILE', { path, encoding }); }
+  deleteFile(path) { return this.send('DELETE_FILE', { path }); }
+  createDir(path) { return this.send('CREATE_DIR', { path }); }
+  mount(fsType, options, mountPoint) { return this.send('MOUNT', { fsType, options, mountPoint }); }
+  unmount(mountPoint) { return this.send('UNMOUNT', { mountPoint }); }
+}
+
+function enqueueFfmpegTask(task) {
+  const next = ffmpegTaskQueue.then(task, task);
+  ffmpegTaskQueue = next.catch(() => {});
+  return next;
+}
+
+async function ensureFfmpegClient() {
+  if (!ffmpegClient) ffmpegClient = new LocalFFmpegClient();
+  await ffmpegClient.load();
+  return ffmpegClient;
+}
+
+async function mountLocalFileForFfmpeg(file) {
+  const ffmpeg = await ensureFfmpegClient();
+  if (ffmpegMounted) {
+    try { await ffmpeg.unmount('/source'); } catch (_) {}
+    ffmpegMounted = false;
+  }
+  try { await ffmpeg.createDir('/source'); } catch (_) {}
+  await ffmpeg.mount('WORKERFS', { files: [file] }, '/source');
+  ffmpegMounted = true;
+  ffmpegInputPath = `/source/${file.name}`;
+  return ffmpegInputPath;
+}
+
+function normalizeProbeTrack(stream) {
+  return {
+    index: Number(stream?.index),
+    codec: String(stream?.codec_name || '').toLowerCase(),
+    language: String(stream?.tags?.language || '').trim(),
+    title: String(stream?.tags?.title || '').trim(),
+    channels: Number(stream?.channels) || 0,
+    default: Number(stream?.disposition?.default) === 1
+  };
+}
+
+async function inspectLocalTracks(file) {
+  const key = fileInspectionKey(file);
+  const inspectionToken = ++inspectionJobToken;
+  if (!file || !/\.mkv$/i.test(file.name || '')) {
+    inspectedTracks = { key: '', audio: [], subtitles: [] };
+    inspectingLocalMedia = false;
+    refreshTrackControls();
+    return;
+  }
+  if (inspectedTracks.key === key && (inspectedTracks.audio.length || inspectedTracks.subtitles.length)) return;
+
+  inspectedTracks = { key, audio: [], subtitles: [] };
+  inspectingLocalMedia = true;
+  selectedInspectedAudio = null;
+  selectedSubtitleValue = 'off';
+  trackOperationMessage = 'Scanning MKV audio and subtitle tracks locally…';
+  refreshTrackControls();
+
+  try {
+    await enqueueFfmpegTask(async () => {
+      const ffmpeg = await ensureFfmpegClient();
+      await mountLocalFileForFfmpeg(file);
+      const probeOutput = `/probe-${inspectionToken}.json`;
+      const code = await ffmpeg.ffprobe(['-v', 'error', '-print_format', 'json', '-show_streams', ffmpegInputPath, '-o', probeOutput]);
+      if (Number(code) !== 0) throw new Error(`ffprobe exited with code ${code}`);
+      const probeText = await ffmpeg.readFile(probeOutput, 'utf8');
+      try { await ffmpeg.deleteFile(probeOutput); } catch (_) {}
+      const probe = JSON.parse(String(probeText || '{}'));
+      const streams = Array.isArray(probe?.streams) ? probe.streams : [];
+      const audio = streams.filter(stream => stream.codec_type === 'audio').map(normalizeProbeTrack);
+      const subtitles = streams.filter(stream => stream.codec_type === 'subtitle').map(normalizeProbeTrack);
+      if (inspectionToken !== inspectionJobToken || fileInspectionKey(currentLocalFile) !== key) return;
+      inspectedTracks = { key, audio, subtitles };
+      const defaultAudio = audio.find(track => track.default) || audio[0];
+      selectedInspectedAudio = defaultAudio ? defaultAudio.index : null;
+    });
+
+    if (inspectionToken !== inspectionJobToken) return;
+    trackOperationMessage = '';
+    if (inspectedTracks.audio.length > 1) showToast(`${inspectedTracks.audio.length} audio tracks found in the MKV`);
+  } catch (err) {
+    console.error('MKV track scan failed', err);
+    if (inspectionToken !== inspectionJobToken) return;
+    inspectedTracks = { key, audio: [], subtitles: [] };
+    trackOperationMessage = 'Could not scan this MKV locally. Browser-native tracks are still available if supported.';
+  } finally {
+    if (inspectionToken === inspectionJobToken) {
+      inspectingLocalMedia = false;
+      refreshTrackControls();
+    }
+  }
+}
+
+function externalTextTrackIndexes() {
+  const textTracks = listTracks(localPlayer.textTracks);
+  const allowed = new Set();
+  for (const el of localPlayer.querySelectorAll('track[data-external-subtitle="true"]')) {
+    const idx = textTracks.findIndex(track => track === el.track);
+    if (idx >= 0) allowed.add(idx);
+  }
+  return allowed;
+}
+
+function generatedTextTrackIndexes() {
+  const textTracks = listTracks(localPlayer.textTracks);
+  const allowed = new Set();
+  for (const el of localPlayer.querySelectorAll('track[data-generated-embedded-subtitle="true"]')) {
+    const idx = textTracks.findIndex(track => track === el.track);
+    if (idx >= 0) allowed.add(idx);
+  }
+  return allowed;
+}
+
 function refreshTrackControls() {
   const localIsActive = activeSource?.type === 'local' && Boolean(currentLocalFile);
   localTrackControls.classList.toggle('hidden', !localIsActive);
   if (!localIsActive) return;
 
-  const audioTracks = listTracks(localPlayer.audioTracks);
+  const nativeAudioTracks = listTracks(localPlayer.audioTracks);
   audioTrackSelect.replaceChildren();
 
-  if (audioTracks.length) {
+  if (inspectedTracks.audio.length) {
+    audioTrackSelect.disabled = inspectingLocalMedia || preparingAudioTrack;
+    for (const track of inspectedTracks.audio) {
+      const option = document.createElement('option');
+      option.value = `scan:${track.index}`;
+      option.textContent = inspectedTrackLabel(track, `Audio track ${track.index + 1}`);
+      audioTrackSelect.appendChild(option);
+    }
+    const fallback = inspectedTracks.audio.find(track => track.default) || inspectedTracks.audio[0];
+    const selected = inspectedTracks.audio.find(track => track.index === selectedInspectedAudio) || fallback;
+    if (selected) audioTrackSelect.value = `scan:${selected.index}`;
+  } else if (nativeAudioTracks.length) {
     audioTrackSelect.disabled = false;
     let selectedAudio = 0;
-    audioTracks.forEach((track, index) => {
+    nativeAudioTracks.forEach((track, index) => {
       const option = document.createElement('option');
-      option.value = String(index);
+      option.value = `native:${index}`;
       option.textContent = mediaTrackLabel(track, `Audio track ${index + 1}`);
       audioTrackSelect.appendChild(option);
       if (track.enabled) selectedAudio = index;
     });
-    audioTrackSelect.value = String(selectedAudio);
+    audioTrackSelect.value = `native:${selectedAudio}`;
   } else {
     const option = document.createElement('option');
     option.value = '';
-    option.textContent = 'Default audio';
+    option.textContent = inspectingLocalMedia ? 'Scanning audio tracks…' : 'Default audio';
     audioTrackSelect.appendChild(option);
     audioTrackSelect.disabled = true;
   }
 
-  const textTracks = listTracks(localPlayer.textTracks)
+  const allTextTracks = listTracks(localPlayer.textTracks);
+  const externalIndexes = externalTextTrackIndexes();
+  const generatedIndexes = generatedTextTrackIndexes();
+  const nativeTextTracks = allTextTracks
     .map((track, index) => ({ track, index }))
-    .filter(({ track }) => ['subtitles', 'captions'].includes(String(track.kind || '').toLowerCase()));
+    .filter(({ track }) => ['subtitles', 'captions'].includes(String(track.kind || '').toLowerCase()))
+    .filter(({ index }) => !inspectedTracks.subtitles.length || externalIndexes.has(index) || generatedIndexes.has(index));
 
   subtitleTrackSelect.replaceChildren();
   const offOption = document.createElement('option');
@@ -644,46 +904,296 @@ function refreshTrackControls() {
   offOption.textContent = 'Off';
   subtitleTrackSelect.appendChild(offOption);
 
-  let selectedSubtitle = 'off';
-  for (const { track, index } of textTracks) {
+  for (const track of inspectedTracks.subtitles) {
     const option = document.createElement('option');
-    option.value = String(index);
+    option.value = `scan:${track.index}`;
+    option.textContent = inspectedTrackLabel(track, `Subtitle ${track.index + 1}`);
+    if (['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'].includes(track.codec)) {
+      option.textContent += ' — image subtitle';
+      option.disabled = true;
+    }
+    subtitleTrackSelect.appendChild(option);
+  }
+
+  for (const { track, index } of nativeTextTracks) {
+    if (generatedIndexes.has(index)) continue;
+    const option = document.createElement('option');
+    option.value = `text:${index}`;
     option.textContent = mediaTrackLabel(track, `Subtitle ${index + 1}`);
     subtitleTrackSelect.appendChild(option);
-    if (track.mode === 'showing') selectedSubtitle = String(index);
   }
-  subtitleTrackSelect.value = selectedSubtitle;
-  subtitleTrackSelect.disabled = textTracks.length === 0;
 
-  const audioMessage = audioTracks.length > 1
-    ? `${audioTracks.length} audio tracks detected.`
-    : audioTracks.length === 1
-      ? 'One audio track detected.'
+  const availableSubtitleValues = new Set([...subtitleTrackSelect.options].map(option => option.value));
+  if (!availableSubtitleValues.has(selectedSubtitleValue)) selectedSubtitleValue = 'off';
+  subtitleTrackSelect.value = selectedSubtitleValue;
+  subtitleTrackSelect.disabled = inspectingLocalMedia || preparingSubtitleTrack || subtitleTrackSelect.options.length <= 1;
+
+  const audioCount = inspectedTracks.audio.length || nativeAudioTracks.length;
+  const subtitleCount = inspectedTracks.subtitles.length + nativeTextTracks.filter(({ index }) => !generatedIndexes.has(index)).length;
+  const audioMessage = audioCount > 1
+    ? `${audioCount} audio tracks available.`
+    : audioCount === 1
+      ? 'One audio track available.'
       : "Using the browser's default audio track.";
-  const subtitleMessage = textTracks.length
-    ? `${textTracks.length} subtitle/caption track${textTracks.length === 1 ? '' : 's'} available.`
-    : 'No embedded subtitles detected; you can add SRT or VTT files.';
-  trackSupportNote.textContent = `${audioMessage} ${subtitleMessage}`;
+  const subtitleMessage = subtitleCount
+    ? `${subtitleCount} subtitle/caption track${subtitleCount === 1 ? '' : 's'} available.`
+    : 'No embedded text subtitles detected; you can add SRT or VTT files.';
+  const wasmMessage = inspectedTracks.audio.length > nativeAudioTracks.length
+    ? 'Non-native audio is prepared locally when selected.'
+    : '';
+  trackSupportNote.textContent = [trackOperationMessage, audioMessage, subtitleMessage, wasmMessage].filter(Boolean).join(' ');
 }
 
-function selectAudioTrack(index) {
-  const audioTracks = listTracks(localPlayer.audioTracks);
-  if (!audioTracks.length) return;
-  const selected = Math.max(0, Math.min(Number(index) || 0, audioTracks.length - 1));
-  audioTracks.forEach((track, i) => {
-    try { track.enabled = i === selected; } catch (_) {}
-  });
+function ensureAudioRouting() {
+  if (audioRoutingContext && audioRoutingGain) {
+    audioRoutingContext.resume?.().catch(() => {});
+    return true;
+  }
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return false;
+  try {
+    audioRoutingContext = new AudioContextClass();
+    audioRoutingSource = audioRoutingContext.createMediaElementSource(localPlayer);
+    audioRoutingGain = audioRoutingContext.createGain();
+    audioRoutingSource.connect(audioRoutingGain).connect(audioRoutingContext.destination);
+    audioRoutingContext.resume?.().catch(() => {});
+    updateAudioRouting();
+    return true;
+  } catch (err) {
+    console.warn('Audio routing unavailable', err);
+    return false;
+  }
+}
+
+function updateAudioRouting() {
+  if (audioRoutingGain && audioRoutingContext) {
+    audioRoutingGain.gain.setValueAtTime(altAudioActive ? 0 : 1, audioRoutingContext.currentTime);
+  }
+  if (altAudioActive) {
+    localAltAudio.volume = localPlayer.volume;
+    localAltAudio.muted = localPlayer.muted;
+  }
+}
+
+function syncAlternativeAudio(force = false) {
+  if (!altAudioActive || !localAltAudio.src) return;
+  localAltAudio.playbackRate = localPlayer.playbackRate || 1;
+  localAltAudio.volume = localPlayer.volume;
+  localAltAudio.muted = localPlayer.muted;
+  const videoTime = Number(localPlayer.currentTime) || 0;
+  const audioTime = Number(localAltAudio.currentTime) || 0;
+  if (force || Math.abs(videoTime - audioTime) > 0.25) {
+    try { localAltAudio.currentTime = videoTime; } catch (_) {}
+  }
+  if (localPlayer.paused || localPlayer.ended) {
+    localAltAudio.pause();
+  } else {
+    localAltAudio.play().then(() => {
+      altAudioPlayWarningShown = false;
+    }).catch(() => {
+      if (!altAudioPlayWarningShown) {
+        altAudioPlayWarningShown = true;
+        showToast('Tap the video once to enable the selected audio');
+      }
+    });
+  }
+}
+
+function clearGeneratedAudio() {
+  audioJobToken += 1;
+  localAltAudio.pause();
+  localAltAudio.removeAttribute('src');
+  localAltAudio.load();
+  if (generatedAudioUrl) URL.revokeObjectURL(generatedAudioUrl);
+  generatedAudioUrl = '';
+  altAudioActive = false;
+  altAudioPlayWarningShown = false;
+  updateAudioRouting();
+}
+
+function clearGeneratedEmbeddedSubtitle(cancelJob = true) {
+  if (cancelJob) subtitleJobToken += 1;
+  for (const el of localPlayer.querySelectorAll('track[data-generated-embedded-subtitle="true"]')) el.remove();
+  if (generatedEmbeddedSubtitleUrl) URL.revokeObjectURL(generatedEmbeddedSubtitleUrl);
+  generatedEmbeddedSubtitleUrl = '';
+}
+
+function canUseNativeInspectedAudio(track) {
+  const nativeAudioTracks = listTracks(localPlayer.audioTracks);
+  if (nativeAudioTracks.length < 2 || nativeAudioTracks.length !== inspectedTracks.audio.length) return -1;
+  return inspectedTracks.audio.findIndex(candidate => candidate.index === track.index);
+}
+
+function audioOutputPlan(track, token) {
+  const baseArgs = ['-y', '-i', ffmpegInputPath, '-map', `0:${track.index}`, '-vn', '-sn', '-dn'];
+  if (track.codec === 'aac') return { output: `/audio-${token}.m4a`, mime: 'audio/mp4', args: [...baseArgs, '-c:a', 'copy', '-f', 'ipod'] };
+  if (track.codec === 'mp3') return { output: `/audio-${token}.mp3`, mime: 'audio/mpeg', args: [...baseArgs, '-c:a', 'copy', '-f', 'mp3'] };
+  if (track.codec === 'opus') return { output: `/audio-${token}.webm`, mime: 'audio/webm', args: [...baseArgs, '-c:a', 'copy', '-f', 'webm'] };
+  if (track.codec === 'vorbis') return { output: `/audio-${token}.ogg`, mime: 'audio/ogg', args: [...baseArgs, '-c:a', 'copy', '-f', 'ogg'] };
+  return { output: `/audio-${token}.m4a`, mime: 'audio/mp4', args: [...baseArgs, '-c:a', 'aac', '-b:a', '192k', '-f', 'ipod'] };
+}
+
+async function activateInspectedAudio(track) {
+  const nativeIndex = canUseNativeInspectedAudio(track);
+  selectedInspectedAudio = track.index;
+  if (nativeIndex >= 0) {
+    clearGeneratedAudio();
+    listTracks(localPlayer.audioTracks).forEach((nativeTrack, index) => {
+      try { nativeTrack.enabled = index === nativeIndex; } catch (_) {}
+    });
+    trackOperationMessage = '';
+    refreshTrackControls();
+    return;
+  }
+
+  ensureAudioRouting();
+  const token = ++audioJobToken;
+  const languageName = displayLanguage(track.language) || track.title || `audio track ${track.index + 1}`;
+  preparingAudioTrack = true;
+  trackOperationMessage = `Preparing ${languageName} locally…`;
   refreshTrackControls();
+
+  try {
+    await enqueueFfmpegTask(async () => {
+      if (!currentLocalFile) throw new Error('No local file selected');
+      if (!ffmpegMounted || !ffmpegInputPath) await mountLocalFileForFfmpeg(currentLocalFile);
+      const ffmpeg = await ensureFfmpegClient();
+      const plan = audioOutputPlan(track, token);
+      const code = await ffmpeg.exec(plan.args);
+      if (Number(code) !== 0) throw new Error(`Audio extraction exited with code ${code}`);
+      const bytes = await ffmpeg.readFile(plan.output);
+      try { await ffmpeg.deleteFile(plan.output); } catch (_) {}
+      if (token !== audioJobToken) return;
+      const blob = new Blob([bytes], { type: plan.mime });
+      if (generatedAudioUrl) URL.revokeObjectURL(generatedAudioUrl);
+      generatedAudioUrl = URL.createObjectURL(blob);
+      localAltAudio.src = generatedAudioUrl;
+      localAltAudio.load();
+      altAudioActive = true;
+      updateAudioRouting();
+      syncAlternativeAudio(true);
+    });
+    if (token !== audioJobToken) return;
+    trackOperationMessage = `${languageName} is playing locally.`;
+  } catch (err) {
+    console.error('Audio track preparation failed', err);
+    if (token === audioJobToken) {
+      clearGeneratedAudio();
+      selectedInspectedAudio = (inspectedTracks.audio.find(candidate => candidate.default) || inspectedTracks.audio[0])?.index ?? null;
+      trackOperationMessage = `Could not prepare ${languageName}; using the default audio.`;
+      showToast('Could not prepare that audio track');
+    }
+  } finally {
+    preparingAudioTrack = false;
+    refreshTrackControls();
+  }
 }
 
-function selectSubtitleTrack(index) {
-  const textTracks = listTracks(localPlayer.textTracks);
-  const selected = index === 'off' ? -1 : Number(index);
-  textTracks.forEach((track, i) => {
+async function selectAudioTrack(value) {
+  if (String(value).startsWith('scan:')) {
+    const streamIndex = Number(String(value).slice(5));
+    const track = inspectedTracks.audio.find(candidate => candidate.index === streamIndex);
+    if (track) await activateInspectedAudio(track);
+    return;
+  }
+
+  if (String(value).startsWith('native:')) {
+    clearGeneratedAudio();
+    const audioTracks = listTracks(localPlayer.audioTracks);
+    const selected = Math.max(0, Math.min(Number(String(value).slice(7)) || 0, audioTracks.length - 1));
+    audioTracks.forEach((track, i) => {
+      try { track.enabled = i === selected; } catch (_) {}
+    });
+    refreshTrackControls();
+  }
+}
+
+function disableAllTextTracks() {
+  listTracks(localPlayer.textTracks).forEach(track => {
     if (!['subtitles', 'captions'].includes(String(track.kind || '').toLowerCase())) return;
-    try { track.mode = i === selected ? 'showing' : 'disabled'; } catch (_) {}
+    try { track.mode = 'disabled'; } catch (_) {}
   });
+}
+
+function subtitleCodecIsText(codec) {
+  return !['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'].includes(String(codec || '').toLowerCase());
+}
+
+async function activateInspectedSubtitle(track) {
+  if (!subtitleCodecIsText(track.codec)) return showToast('This image-based subtitle cannot be converted to browser text');
+  selectedSubtitleValue = `scan:${track.index}`;
+  disableAllTextTracks();
+  const token = ++subtitleJobToken;
+  const languageName = displayLanguage(track.language) || track.title || `subtitle ${track.index + 1}`;
+  preparingSubtitleTrack = true;
+  trackOperationMessage = `Preparing ${languageName} subtitles locally…`;
   refreshTrackControls();
+
+  try {
+    await enqueueFfmpegTask(async () => {
+      if (!currentLocalFile) throw new Error('No local file selected');
+      if (!ffmpegMounted || !ffmpegInputPath) await mountLocalFileForFfmpeg(currentLocalFile);
+      const ffmpeg = await ensureFfmpegClient();
+      const output = `/subtitle-${token}.vtt`;
+      const code = await ffmpeg.exec(['-y', '-i', ffmpegInputPath, '-map', `0:${track.index}`, '-c:s', 'webvtt', output]);
+      if (Number(code) !== 0) throw new Error(`Subtitle extraction exited with code ${code}`);
+      const bytes = await ffmpeg.readFile(output);
+      try { await ffmpeg.deleteFile(output); } catch (_) {}
+      if (token !== subtitleJobToken) return;
+      clearGeneratedEmbeddedSubtitle(false);
+      const text = new TextDecoder().decode(bytes);
+      generatedEmbeddedSubtitleUrl = URL.createObjectURL(new Blob([text], { type: 'text/vtt;charset=utf-8' }));
+      const trackElement = document.createElement('track');
+      trackElement.kind = 'subtitles';
+      trackElement.label = languageName;
+      if (track.language) trackElement.srclang = track.language;
+      trackElement.src = generatedEmbeddedSubtitleUrl;
+      trackElement.dataset.generatedEmbeddedSubtitle = 'true';
+      localPlayer.appendChild(trackElement);
+      try { trackElement.track.mode = 'showing'; } catch (_) {}
+    });
+    if (token !== subtitleJobToken) return;
+    trackOperationMessage = `${languageName} subtitles enabled.`;
+  } catch (err) {
+    console.error('Embedded subtitle preparation failed', err);
+    if (token === subtitleJobToken) {
+      selectedSubtitleValue = 'off';
+      trackOperationMessage = `Could not prepare ${languageName} subtitles.`;
+      showToast('Could not prepare that subtitle track');
+    }
+  } finally {
+    preparingSubtitleTrack = false;
+    refreshTrackControls();
+  }
+}
+
+async function selectSubtitleTrack(value) {
+  const selectedValue = String(value || 'off');
+  if (selectedValue === 'off') {
+    selectedSubtitleValue = 'off';
+    disableAllTextTracks();
+    trackOperationMessage = '';
+    refreshTrackControls();
+    return;
+  }
+
+  if (selectedValue.startsWith('scan:')) {
+    const streamIndex = Number(selectedValue.slice(5));
+    const track = inspectedTracks.subtitles.find(candidate => candidate.index === streamIndex);
+    if (track) await activateInspectedSubtitle(track);
+    return;
+  }
+
+  if (selectedValue.startsWith('text:')) {
+    const selected = Number(selectedValue.slice(5));
+    selectedSubtitleValue = selectedValue;
+    listTracks(localPlayer.textTracks).forEach((track, i) => {
+      if (!['subtitles', 'captions'].includes(String(track.kind || '').toLowerCase())) return;
+      try { track.mode = i === selected ? 'showing' : 'disabled'; } catch (_) {}
+    });
+    trackOperationMessage = '';
+    refreshTrackControls();
+  }
 }
 
 function inferSubtitleLanguage(filename) {
@@ -744,7 +1254,7 @@ async function addExternalSubtitles(files) {
   if (firstAddedTrack) {
     const textTracks = listTracks(localPlayer.textTracks);
     const firstIndex = textTracks.findIndex(track => track === firstAddedTrack);
-    if (firstIndex >= 0) selectSubtitleTrack(String(firstIndex));
+    if (firstIndex >= 0) selectSubtitleTrack(`text:${firstIndex}`);
     showToast(`${selectedFiles.length === 1 ? 'Subtitle' : 'Subtitles'} added`);
   }
 }
@@ -760,10 +1270,37 @@ for (const trackList of [localPlayer.textTracks, localPlayer.audioTracks]) {
   trackList.addEventListener('change', refreshTrackControls);
 }
 
+localPlayer.addEventListener('play', () => {
+  audioRoutingContext?.resume?.().catch(() => {});
+  syncAlternativeAudio(true);
+});
+localPlayer.addEventListener('playing', () => syncAlternativeAudio(true));
+localPlayer.addEventListener('pause', () => { if (altAudioActive) localAltAudio.pause(); });
+localPlayer.addEventListener('ended', () => { if (altAudioActive) localAltAudio.pause(); });
+localPlayer.addEventListener('waiting', () => { if (altAudioActive) localAltAudio.pause(); });
+localPlayer.addEventListener('seeking', () => syncAlternativeAudio(true));
+localPlayer.addEventListener('seeked', () => syncAlternativeAudio(true));
+localPlayer.addEventListener('ratechange', () => syncAlternativeAudio(false));
+localPlayer.addEventListener('volumechange', updateAudioRouting);
+localPlayer.addEventListener('timeupdate', () => syncAlternativeAudio(false));
+localAltAudio.addEventListener('loadedmetadata', () => syncAlternativeAudio(true));
+
 function attachLocalFile(file) {
   if (!file) return;
+  inspectionJobToken += 1;
+  if ((inspectingLocalMedia || preparingAudioTrack || preparingSubtitleTrack) && ffmpegClient?.worker) {
+    ffmpegClient.terminate();
+    ffmpegMounted = false;
+    ffmpegInputPath = '';
+  }
   if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
+  clearGeneratedAudio();
+  clearGeneratedEmbeddedSubtitle();
   clearExternalSubtitles();
+  inspectedTracks = { key: '', audio: [], subtitles: [] };
+  selectedInspectedAudio = null;
+  selectedSubtitleValue = 'off';
+  trackOperationMessage = '';
   currentLocalFile = file;
   currentLocalMeta = fileMeta(file);
   localReady = false;
@@ -771,6 +1308,7 @@ function attachLocalFile(file) {
   localPlayer.src = localObjectUrl;
   localPlayer.load();
   refreshTrackControls();
+  inspectLocalTracks(file);
 }
 
 function activateSource(source) {
@@ -781,6 +1319,7 @@ function activateSource(source) {
   activeMediaKey = nextKey;
 
   if (source.type === 'youtube') {
+    clearGeneratedAudio();
     localPlayer.pause();
     localPlayer.classList.add('hidden');
     youtubeSurface.classList.remove('hidden');
@@ -938,6 +1477,13 @@ function startPlayerPolling() {
 
 window.addEventListener('beforeunload', () => {
   if (localObjectUrl) URL.revokeObjectURL(localObjectUrl);
+  if (generatedAudioUrl) URL.revokeObjectURL(generatedAudioUrl);
+  if (generatedEmbeddedSubtitleUrl) URL.revokeObjectURL(generatedEmbeddedSubtitleUrl);
+  if (ffmpegWorkerBlobUrl) URL.revokeObjectURL(ffmpegWorkerBlobUrl);
+  if (ffmpegCoreBlobUrl) URL.revokeObjectURL(ffmpegCoreBlobUrl);
+  if (ffmpegWasmBlobUrl) URL.revokeObjectURL(ffmpegWasmBlobUrl);
+  try { ffmpegClient?.terminate(); } catch (_) {}
+  try { audioRoutingContext?.close?.(); } catch (_) {}
   for (const url of externalSubtitleUrls) URL.revokeObjectURL(url);
   if (voiceJoined) {
     navigator.sendBeacon('/api/action', new Blob([JSON.stringify({
