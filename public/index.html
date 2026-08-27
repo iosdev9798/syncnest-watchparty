@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="Free synchronized YouTube and local-video watch rooms with built-in voice calls." />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
   <title>SyncNest — Watch & Talk Together</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -62,7 +63,6 @@
           <div class="player-wrap">
             <div id="youtubePlayer" class="player-surface"><div id="player"></div></div>
             <video id="localPlayer" class="player-surface hidden" controls playsinline preload="metadata"></video>
-            <audio id="localAltAudio" preload="auto" aria-hidden="true"></audio>
             <div id="emptyState" class="empty-state">
               <div class="playmark">▶</div>
               <h3 id="emptyTitle">Choose a video source above</h3>
@@ -87,7 +87,7 @@
               <label for="subtitleFile">External subtitles</label>
               <input id="subtitleFile" type="file" accept=".srt,.vtt,text/vtt,application/x-subrip" multiple aria-label="Add SRT or VTT subtitles" />
             </div>
-            <p id="trackSupportNote" class="track-support-note">For MKV files, SyncNest scans embedded tracks locally. Selecting a non-native audio track may require local preparation in your browser. You can also add SRT or VTT subtitle files.</p>
+            <p id="trackSupportNote" class="track-support-note">Embedded audio/subtitle tracks appear here when your browser exposes them. You can also add SRT or VTT subtitle files.</p>
           </div>
 
           <p class="tip"><strong>YouTube:</strong> everyone receives the same link. <strong>Local video:</strong> the file is never uploaded; each person selects the same file on their own computer. Play, pause and seeking stay synchronized. Audio language and subtitle choices are local to each viewer.</p>
@@ -133,7 +133,6 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="https://www.youtube.com/iframe_api"></script>
   <script src="/app.js"></script>
 </body>
 </html>
